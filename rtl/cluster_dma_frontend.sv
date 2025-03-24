@@ -10,6 +10,9 @@
 //
 // Thomas Benz <tbenz@iis.ee.ethz.ch>
 
+`include "axi/typedef.svh"
+`include "idma/typedef.svh"
+
 /// replaces the mchan in the pulp cluster if the new AXI DMA should be used
 /// strictly 32 bit on the TCDM side.
 module cluster_dma_frontend #(
@@ -70,6 +73,8 @@ module cluster_dma_frontend #(
     output logic                      term_irq_pe_o
 );
 
+    import idma_pkg::*;
+
     // number of register sets in fe
     localparam int unsigned NumRegs  = NumCores + 1;
 
@@ -79,8 +84,17 @@ module cluster_dma_frontend #(
     // distributer index width
     localparam int unsigned DistrIdxWidth = (NumStreams > 32'd1) ? unsigned'($clog2(NumStreams)) : 32'd1;
 
+    // dependent parameters
+    localparam int unsigned DmaStrbWidth = DmaDataWidth / 8;
+    localparam int unsigned DmaUserWidth = 4; //soc_cfg_pkg::AXI_UW;
+
     // DMA transfer descriptor
     typedef logic [DmaAddrWidth-1:0] addr_t;
+    typedef logic [DmaDataWidth-1:0] data_t;
+    typedef logic [DmaStrbWidth-1:0] strb_t;
+    typedef logic [DmaUserWidth-1:0] user_t;
+    typedef logic [DmaAxiIdWidth-1:0] id_t;
+    typedef logic [DmaAddrWidth-1:0] tf_len_t;
     typedef logic             [31:0] num_bytes_t;
     typedef struct packed {
         num_bytes_t num_bytes;
@@ -93,18 +107,16 @@ module cluster_dma_frontend #(
 
     // 1D burst request
     typedef logic [DmaAxiIdWidth-1:0] axi_id_t;
-    typedef struct packed {
-        axi_id_t            id;
-        addr_t              src, dst;
-        num_bytes_t         num_bytes;
-        axi_pkg::cache_t    cache_src, cache_dst;
-        axi_pkg::burst_t    burst_src, burst_dst;
-        logic               decouple_rw;
-        logic               deburst;
-        logic               serialize;
-    } burst_req_t;
 
-    burst_req_t burst_req;
+    // AXI typedef
+    `AXI_TYPEDEF_ALL(axi_xbar, addr_t, id_t, data_t, strb_t, user_t)
+
+    // iDMA request / response types
+    `IDMA_TYPEDEF_FULL_REQ_T(idma_req_t, id_t, addr_t, tf_len_t)
+    `IDMA_TYPEDEF_FULL_RSP_T(idma_rsp_t, addr_t)
+
+    idma_req_t idma_req;
+    idma_pkg::idma_busy_t idma_busy;
 
     // transaction id
     logic [NumStreams-1:0][27:0] next_id, done_id;
@@ -120,8 +132,6 @@ module cluster_dma_frontend #(
     transf_descr_t               transf_descr_arb;
     logic                        be_ready_arb;
     logic                        be_valid_arb;
-    // zero length transfer
-    // logic                        zero_length;
     // distributed outputs
     logic [NumStreams-1:0]       be_ready_stream;
     logic [NumStreams-1:0]       be_valid_stream;
@@ -132,7 +142,6 @@ module cluster_dma_frontend #(
 
     // the backend chosen
     logic [DistrIdxWidth-1:0]    be_idx_arb;
-
 
     // generate registers for cores
     for (genvar i = 0; i < NumCores; i++) begin : gen_core_regs
@@ -211,20 +220,46 @@ module cluster_dma_frontend #(
         .idx_o      ( pe_idx_arb         )
     );
 
-    // map arbitrated transfer descriptor onto generic burst request
-    always_comb begin : proc_map_to_1D_burst
-        burst_req             = '0;
-        burst_req.src         =  transf_descr_arb.src_addr;
-        burst_req.dst         =  transf_descr_arb.dst_addr;
-        burst_req.num_bytes   =  transf_descr_arb.num_bytes;
-        burst_req.burst_src   = axi_pkg::BURST_INCR;
-        burst_req.burst_dst   = axi_pkg::BURST_INCR;
-        burst_req.decouple_rw = transf_descr_arb.decouple;
-        burst_req.deburst     = transf_descr_arb.deburst;
-        burst_req.serialize   = transf_descr_arb.serialize;
+    // assemble the new request from the old
+    always_comb begin : proc_idma_req
+      idma_req = '0;
 
-        // assign zero length signal
-        // zero_length           =  transf_descr_arb.num_bytes == 0;
+      idma_req.length   = transf_descr_arb.num_bytes;
+      idma_req.src_addr = transf_descr_arb.src_addr;
+      idma_req.dst_addr = transf_descr_arb.dst_addr;
+
+      idma_req.opt.axi_id             = '0; // AXI ID must be non null if want to take advantage of interleaving
+      // DMA only supports incremental burst
+      idma_req.opt.src.burst          = axi_pkg::BURST_INCR;
+      idma_req.opt.src.cache          = '0;
+      // AXI4 does not support locked transactions, use atomics
+      idma_req.opt.src.lock           = '0;
+      // unpriviledged, secure, data access
+      idma_req.opt.src.prot           = '0;
+      // not participating in qos
+      idma_req.opt.src.qos            = '0;
+      // only one region
+      idma_req.opt.src.region         = '0;
+      // DMA only supports incremental burst
+      idma_req.opt.dst.burst          = axi_pkg::BURST_INCR;
+      idma_req.opt.dst.cache          = '0;
+      // AXI4 does not support locked transactions, use atomics
+      idma_req.opt.dst.lock           = '0;
+      // unpriviledged, secure, data access
+      idma_req.opt.dst.prot           = '0;
+      // not participating in qos
+      idma_req.opt.dst.qos            = '0;
+      // only one region in system
+      idma_req.opt.dst.region         = '0;
+      // ensure coupled AW to avoid deadlocks
+      idma_req.opt.beo.decouple_aw    = '0;
+      idma_req.opt.beo.decouple_rw    = transf_descr_arb.decouple;
+      // this compatibility layer only supports completely debursting
+      idma_req.opt.beo.src_max_llen   = '0;
+      // this compatibility layer only supports completely debursting
+      idma_req.opt.beo.dst_max_llen   = '0;
+      idma_req.opt.beo.src_reduce_len = transf_descr_arb.deburst;
+      idma_req.opt.beo.dst_reduce_len = transf_descr_arb.deburst;
     end
 
     rr_distributor #(
@@ -243,43 +278,70 @@ module cluster_dma_frontend #(
 
     for (genvar i = 0; i < NumStreams; i++) begin : gen_backends
 
-        // // modify id
-        // burst_req_t burst_req_stream;
-        // always_comb begin : proc_modify_id
-        //     burst_req_stream    = burst_req;
-        //     burst_req_stream.id = burst_req.id + i;
-        // end
-
         logic issue;
 
-        // instantiate backend :)
-        axi_dma_backend #(
-            .DataWidth       ( DmaDataWidth    ),
-            .AddrWidth       ( DmaAddrWidth    ),
-            .IdWidth         ( DmaAxiIdWidth   ),
-            .AxReqFifoDepth  ( AxiAxReqDepth   ),
-            .TransFifoDepth  ( TfReqFifoDepth  ),
-            .BufferDepth     ( 3               ), // minimal 3 for giving full performance
-            .axi_req_t       ( axi_req_t       ),
-            .axi_res_t       ( axi_res_t       ),
-            .burst_req_t     ( burst_req_t     ),
-            .DmaIdWidth      ( 6               ),
-            .DmaTracing      ( 0               )
-        ) i_axi_dma_backend (
-            .clk_i            ( clk_i                     ),
-            .rst_ni           ( rst_ni                    ),
-            .dma_id_i         ( cluster_id_i              ),
-            .axi_dma_req_o    ( axi_dma_req_o         [i] ),
-            .axi_dma_res_i    ( axi_dma_res_i         [i] ),
-            .burst_req_i      ( burst_req                 ),
-            .valid_i          ( be_valid_stream       [i] ),
-            .ready_o          ( be_ready_stream       [i] ),
-            .backend_idle_o   ( be_idle_stream        [i] ),
-            .trans_complete_o ( trans_complete_stream [i] )
+        idma_backend #(
+          .DataWidth           ( DmaDataWidth                   ),
+          .AddrWidth           ( DmaAddrWidth                   ),
+          .AxiIdWidth          ( DmaAxiIdWidth                  ),
+          .UserWidth           ( DmaUserWidth                   ),
+          .TFLenWidth          ( DmaAddrWidth                   ),
+          .MaskInvalidData     ( 1                              ),
+          .BufferDepth         ( 32                             ),
+          .RAWCouplingAvail    ( 1                              ),
+          .HardwareLegalizer   ( 1                              ),
+          .RejectZeroTransfers ( 1                              ),
+          .ErrorCap            ( idma_pkg::NO_ERROR_HANDLING    ),
+          .NumAxInFlight       ( AxiAxReqDepth                  ),
+          .MemSysDepth         ( 0                              ),
+          .idma_req_t          ( idma_req_t                     ),
+          .idma_rsp_t          ( idma_rsp_t                     ),
+          .idma_eh_req_t       ( idma_pkg::idma_eh_req_t        ),
+          .idma_busy_t         ( idma_pkg::idma_busy_t          ),
+          .protocol_req_t      ( axi_xbar_req_t                 ),
+          .protocol_rsp_t      ( axi_xbar_resp_t                ),
+          .aw_chan_t           ( axi_xbar_aw_chan_t             ),
+          .ar_chan_t           ( axi_xbar_ar_chan_t             )
+        ) i_idma_backend (
+          //
+          // Generic
+          //
+          .clk_i          ( clk_i                           ),
+          .rst_ni         ( rst_ni                          ),
+          .testmode_i     ( 1'b0                            ),
+          //
+          // iDMA request
+          //
+          .idma_req_i     ( idma_req                        ),
+          .req_valid_i    ( be_valid_stream       [i]       ),
+          .req_ready_o    ( be_ready_stream       [i]       ),
+          //
+          // iDMA response
+          //
+          .idma_rsp_o     ( /* NOT CONNECTED */             ),
+          .rsp_valid_o    ( trans_complete_stream [i]       ),
+          .rsp_ready_i    ( 1'b1                            ),
+          //
+          // Error handler
+          //
+          .idma_eh_req_i  ( '0                              ),
+          .eh_req_valid_i ( 1'b1                            ),
+          .eh_req_ready_o ( /* NOT CONNECTED */             ),
+          //
+          // Manager
+          //
+          .protocol_req_o ( axi_dma_req_o         [i]       ),
+          .protocol_rsp_i ( axi_dma_res_i         [i]       ),
+          //
+          // Busy flag
+          //
+          .busy_o         ( idma_busy                       )
         );
 
+        assign be_idle_stream[i] = ~|idma_busy;
+
         // only increment issue counter if we have a valid transfer
-        assign issue = be_ready_stream[i] & be_valid_stream[i]; /*& !zero_length;*/
+        assign issue = be_ready_stream[i] & be_valid_stream[i];
 
         // transfer id
         cluster_dma_transfer_id_gen #(

@@ -16,16 +16,16 @@
  * Francesco Conti <fconti@iis.ee.ethz.ch>
  */
 
-import apu_package::*;
-
 // USER DEFINED MACROS to improve self-testing capabilities
 `ifndef PULP_FPGA_SIM
+`ifndef SYNTHESIS
   `define DEBUG_FETCH_INTERFACE
+`endif
 `endif
 //`define DATA_MISS
 //`define DUMP_INSTR_FETCH
 
-module core_region
+module core_region import apu_package::*;
 #(
   // CORE PARAMETERS
   parameter int     CORE_ID                 = 0,
@@ -35,6 +35,10 @@ module core_region
   parameter bit     CLUSTER_ALIAS           = 1'b1,
   parameter int     CLUSTER_ALIAS_BASE      = 12'h000,
   parameter int     REMAP_ADDRESS           = 0,
+  parameter int     DEBUG_HALT_ADDR         = 32'h0000_0000,
+  parameter bit     ADDREXT                 = 1'b0,
+  parameter bit     FPU                     = 1'b0,
+  parameter bit     FP_DIVSQRT              = 1'b0,
   parameter bit     DEM_PER_BEFORE_TCDM_TS  = 1'b0
 `ifndef SYNTHESIS
   ,
@@ -72,14 +76,15 @@ module core_region
   output logic [31:0] 		      instr_addr_o,
   input logic [INSTR_RDATA_WIDTH-1:0] instr_r_rdata_i,
   input logic 			      instr_r_valid_i,
-				      
-				      XBAR_TCDM_BUS.Slave debug_bus,
-  output logic 			      debug_core_halted_o,
-  input logic 			      debug_core_halt_i,
-  input logic 			      debug_core_resume_i,
+
+  input logic             debug_req_i,
+
+  output logic                  unaligned_o,
+  input logic [31:0]            addrext_i,
 				      
 				      // Interface for DEMUX to TCDM INTERCONNECT ,PERIPHERAL INTERCONNECT and DMA CONTROLLER
 				      XBAR_TCDM_BUS.Master tcdm_data_master,
+				      output logic [5:0]     tcdm_data_master_atop,
 				      XBAR_TCDM_BUS.Master dma_ctrl_master,
 				      XBAR_PERIPH_BUS.Master eu_ctrl_master,
 				      XBAR_PERIPH_BUS.Master periph_data_master,
@@ -106,12 +111,15 @@ module core_region
   riscv_core #(
     .INSTR_RDATA_WIDTH   ( INSTR_RDATA_WIDTH ),
     .N_EXT_PERF_COUNTERS ( 5                 ),
+    .PULP_SECURE         ( 0                 ),
     .FPU                 ( FPU               ),
+    .FP_DIVSQRT          ( FP_DIVSQRT        ),
     .SHARED_FP           ( SHARED_FP         ),
-    .SHARED_DSP_MULT     ( SHARED_DSP_MULT   ),
-    .SHARED_INT_DIV      ( SHARED_INT_DIV    ),
+    .SHARED_DSP_MULT     ( 0                 ),
+    .SHARED_INT_DIV      ( 0                 ),
     .SHARED_FP_DIVSQRT   ( SHARED_FP_DIVSQRT ),
-    .WAPUTYPE            ( WAPUTYPE          )
+    .WAPUTYPE            ( WAPUTYPE          ),
+    .DM_HaltAddress      ( DEBUG_HALT_ADDR   )
   ) RISCV_CORE (
     .clk_i                 ( clk_i                    ),
     .rst_ni                ( rst_ni                   ),
@@ -138,7 +146,7 @@ module core_region
     .data_rdata_i          ( s_core_bus.r_rdata       ),
     .data_gnt_i            ( s_core_bus.gnt           ),
     .data_rvalid_i         ( s_core_bus.r_valid       ),
-    .data_err_i            ( 1'b0                     ),
+    .data_unaligned_o      ( unaligned_o              ),
 
     .irq_i                 ( irq_req_i                ),
     .irq_id_i              ( irq_id_i                 ),
@@ -146,18 +154,9 @@ module core_region
     .irq_ack_o             ( irq_ack_o                ),
 
     .sec_lvl_o             (                          ),
-    .irq_sec_i             (                          ),
+    .irq_sec_i             (      1'b0                ),
 
-    .debug_req_i           ( debug_bus.req            ),
-    .debug_gnt_o           ( debug_bus.gnt            ),
-    .debug_rvalid_o        ( debug_bus.r_valid        ),
-    .debug_addr_i          ( debug_bus.add[14:0]      ),
-    .debug_we_i            ( ~debug_bus.wen           ),
-    .debug_wdata_i         ( debug_bus.wdata          ),
-    .debug_rdata_o         ( debug_bus.r_rdata        ),
-    .debug_halted_o        ( debug_core_halted_o      ),
-    .debug_halt_i          ( debug_core_halt_i        ),
-    .debug_resume_i        ( debug_core_resume_i      ),
+    .debug_req_i           ( debug_req_i              ),
 
     .fetch_enable_i        ( fetch_en_i               ),
     .core_busy_o           ( core_busy_o              ),
@@ -180,8 +179,6 @@ module core_region
     .fregfile_disable_i    ( fregfile_disable_i       )
   );
 
-  assign debug_bus.r_opc = 1'b0;
-
   // Bind to 0 Unused Signals in CORE interface
   assign s_core_bus.r_gnt       = 1'b0;
   assign s_core_bus.barrier     = 1'b0;
@@ -199,6 +196,7 @@ module core_region
     .CLUSTER_ALIAS          ( CLUSTER_ALIAS           ),
     .CLUSTER_ALIAS_BASE     ( CLUSTER_ALIAS_BASE      ),
     .DEM_PER_BEFORE_TCDM_TS ( DEM_PER_BEFORE_TCDM_TS  ),
+    .ADDREXT                ( ADDREXT                 ),
     .REMAP_ADDRESS          ( REMAP_ADDRESS           )
   ) core_demux_i (
     .clk                (  clk_int                    ),
@@ -213,6 +211,7 @@ module core_region
     .data_wdata_i       (  s_core_bus.wdata           ),
     .data_be_i          (  s_core_bus.be              ),
     .data_gnt_o         (  s_core_bus.gnt             ),
+    .addrext_i,
     .data_r_gnt_i       (  s_core_bus.r_gnt           ),
     .data_r_valid_o     (  s_core_bus.r_valid         ),
     .data_r_opc_o       (                             ),
@@ -221,6 +220,7 @@ module core_region
     .data_req_o_SH      (  tcdm_data_master.req       ),
     .data_add_o_SH      (  tcdm_data_master.add       ),
     .data_wen_o_SH      (  tcdm_data_master.wen       ),
+    .data_atop_o_SH     (  tcdm_data_master_atop      ),
     .data_wdata_o_SH    (  tcdm_data_master.wdata     ),
     .data_be_o_SH       (  tcdm_data_master.be        ),
     .data_gnt_i_SH      (  tcdm_data_master.gnt       ),
@@ -254,6 +254,10 @@ module core_region
     .perf_l2_st_cyc_o   (  perf_counters[3]           ),
     .CLUSTER_ID         (  cluster_id_i               )
   );
+  always_comb begin
+    periph_data_master.id = '0;
+    periph_data_master.id[CORE_ID] = 1'b1;
+  end
 
   periph_demux #(
     .DEM_PER_BEFORE_TCDM_TS (DEM_PER_BEFORE_TCDM_TS)

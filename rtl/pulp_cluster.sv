@@ -656,8 +656,11 @@ module pulp_cluster import pulp_cluster_package::*; import apu_package::*; impor
     .busy_o               ( s_axi2per_busy    )
   );
 
+  /* Having NB_MPERIPHS = 1 It does not make sense to have a demux here, but
+      the interconnect needs an array data type so you cannot directly route `s_mperiph_bus` to it */
+
   per_demux_wrap #(
-    .NB_MASTERS  (  2 ),
+    .NB_MASTERS  (  2 ), // set to 2, but only 1 is effectively implemented
     .ADDR_OFFSET ( 20 )
   ) per_demux_wrap_i (
     .clk_i   ( clk_cluster         ),

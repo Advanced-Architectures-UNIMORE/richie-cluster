@@ -84,6 +84,13 @@ module cluster_interconnect_wrap
   logic [NB_CORES+NB_HWACC_PORTS-1:0][DATA_WIDTH-1:0] s_core_tcdm_bus_r_rdata;
   logic [NB_CORES+NB_HWACC_PORTS-1:0]                 s_core_tcdm_bus_r_valid;
 
+  // LOGARITHMIC INTERCONNECT
+  logic [NB_TCDM_BANKS-1:0][ADDR_MEM_WIDTH-1:0] s_tcdm_bus_add;
+  logic [NB_TCDM_BANKS-1:0]                     s_tcdm_bus_req;
+  logic [NB_TCDM_BANKS-1:0]                     s_tcdm_bus_gnt;
+  logic [NB_TCDM_BANKS-1:0]                     s_tcdm_bus_wen;
+  logic [NB_TCDM_BANKS-1:0][BE_WIDTH-1:0]       s_tcdm_bus_be;
+
   // LOGARITHMIC INTERCONNECT --> AMO Shims
   logic [NB_TCDM_BANKS-1:0][ADDR_MEM_WIDTH-1:0] s_tcdm_bus_amo_shim_add;
   logic [NB_TCDM_BANKS-1:0]                     s_tcdm_bus_amo_shim_req;
@@ -140,119 +147,187 @@ module cluster_interconnect_wrap
   } tcdm_data_t;
   tcdm_data_t [NUM_TCDM_ICONN_IN-1:0] iconn_inp_wdata, iconn_inp_rdata;
   tcdm_data_t     [NB_TCDM_BANKS-1:0] iconn_oup_wdata, iconn_oup_rdata;
-  tcdm_interconnect #(
-    .NumIn        ( NUM_TCDM_ICONN_IN           ),
-    .NumOut       ( NB_TCDM_BANKS               ),
-    .AddrWidth    ( ADDR_WIDTH                  ),
-    .DataWidth    ( $bits(tcdm_data_t)          ),
-    .ByteOffWidth ( $clog2(DATA_WIDTH-1)-3      ), // determine byte offset from real data width
-    .AddrMemWidth ( ADDR_MEM_WIDTH              ),
-    .WriteRespOn  ( 1                           ),
-    .RespLat      ( 1                           ),
-    .Topology     ( tcdm_interconnect_pkg::LIC  )
-  ) i_tcdm_interconnect (
-    .clk_i,
-    .rst_ni,
 
-    .req_i    ( { s_dma_bus_req,      s_core_tcdm_bus_req}      ),
-    .add_i    ( { s_dma_bus_add,      s_core_tcdm_bus_add}      ),
-    .wen_i    ( { s_dma_bus_wen,      s_core_tcdm_bus_wen}      ),
-    .wdata_i  ( iconn_inp_wdata                                 ),
-    .be_i     ( { s_dma_bus_be,       s_core_tcdm_bus_be}       ),
-    .gnt_o    ( { s_dma_bus_gnt,      s_core_tcdm_bus_gnt}      ),
-    .vld_o    ( { s_dma_bus_r_valid,  s_core_tcdm_bus_r_valid}  ),
-    .rdata_o  ( iconn_inp_rdata                                 ),
-
-    .req_o    ( s_tcdm_bus_amo_shim_req   ),
-    .gnt_i    ( s_tcdm_bus_amo_shim_gnt   ),
-    .add_o    ( s_tcdm_bus_amo_shim_add   ),
-    .wen_o    ( s_tcdm_bus_amo_shim_wen   ),
-    .wdata_o  ( iconn_oup_wdata           ),
-    .be_o     ( s_tcdm_bus_amo_shim_be    ),
-    .rdata_i  ( iconn_oup_rdata           )
-  );
-  for (genvar i = 0; i < NUM_TCDM_ICONN_IN; i++) begin : gen_iconn_pack_inp_data
-    if (i < NB_CORES + NB_HWACC_PORTS) begin
-      assign iconn_inp_wdata[i].data = s_core_tcdm_bus_wdata[i];
-      assign s_core_tcdm_bus_r_rdata[i] = iconn_inp_rdata[i].data;
-    end else begin
-      assign iconn_inp_wdata[i].data = s_dma_bus_wdata[i - (NB_CORES + NB_HWACC_PORTS)];
-      assign s_dma_bus_r_rdata[i - (NB_CORES + NB_HWACC_PORTS)] = iconn_inp_rdata[i].data;
-    end
-    if (i < NB_CORES) begin
-      assign iconn_inp_wdata[i].atop = core_tcdm_slave_atop[i];
-    end else if (i < NB_CORES + NB_EXT) begin
-      assign iconn_inp_wdata[i].atop = ext_slave_atop[i-NB_CORES];
-    end else begin
-      assign iconn_inp_wdata[i].atop = '0;
-    end
-  end
-
-  for (genvar i = 0; i < NB_TCDM_BANKS; i++) begin : gen_amo_shim
-    // Map ATOPs by RI5CYs to AMOs.
-    logic [DATA_WIDTH-1:0] data;
-    logic [5:0] atop;
-    logic [3:0] amo;
-    assign atop = iconn_oup_wdata[i].atop;
-    always_comb begin
-      amo = '0;
-      data = iconn_oup_wdata[i].data;
-      if (atop[5]) begin
-        unique casez (atop[4:0])
-          riscv_defines::AMO_ADD:   amo = 4'h2;
-          riscv_defines::AMO_SWAP:  amo = 4'h1;
-          riscv_defines::AMO_LR:    `ifndef TARGET_SYNTHESIS $error("Unsupported LR on L1!") `endif;
-          riscv_defines::AMO_SC:    `ifndef TARGET_SYNTHESIS $error("Unsupported SC on L1!") `endif;
-          default: begin
-            `ifndef TARGET_SYNTHESIS
-              assert (atop[1:0] == '0) else $error("Illegal AMO!");
-            `endif
-            unique case (atop[4:2])
-              riscv_defines::AMO_XOR[4:2]:  amo = 4'h5;
-              riscv_defines::AMO_OR[4:2]:   amo = 4'h4;
-              riscv_defines::AMO_AND[4:2]:  amo = 4'h3;
-              riscv_defines::AMO_MIN[4:2]:  amo = 4'h8;
-              riscv_defines::AMO_MAX[4:2]:  amo = 4'h6;
-              riscv_defines::AMO_MINU[4:2]: amo = 4'h9;
-              riscv_defines::AMO_MAXU[4:2]: amo = 4'h7;
-            endcase
-          end
-        endcase
-      end else begin
-        amo = 4'h0; // AMONone
-      end
-    end
-    logic write_enable;
-    logic [ADDR_MEM_WIDTH+2-1:0] addr;
-    amo_shim #(
-      .AddrMemWidth (ADDR_MEM_WIDTH+2),
-      .DataWidth    (DATA_WIDTH)
-    ) i_amo_shim (
+  /* TCDM interconnect -> AMO shim (atomic memory ops) -> SRAM */
+  if(L1_AMO_PRESENT == 1) begin : tcdm_interco_w_amo
+    tcdm_interconnect #(
+      .NumIn        ( NUM_TCDM_ICONN_IN           ),
+      .NumOut       ( NB_TCDM_BANKS               ),
+      .AddrWidth    ( ADDR_WIDTH                  ),
+      .DataWidth    ( $bits(tcdm_data_t)          ),
+      .ByteOffWidth ( $clog2(DATA_WIDTH-1)-3      ), // determine byte offset from real data width
+      .AddrMemWidth ( ADDR_MEM_WIDTH              ),
+      .WriteRespOn  ( 1                           ),
+      .RespLat      ( 1                           ),
+      .Topology     ( tcdm_interconnect_pkg::LIC  )
+    ) i_tcdm_interconnect (
       .clk_i,
       .rst_ni,
 
-      .in_req_i     (s_tcdm_bus_amo_shim_req[i]),
-      .in_gnt_o     (s_tcdm_bus_amo_shim_gnt[i]),
-      .in_add_i     ({s_tcdm_bus_amo_shim_add[i], 2'b00}),
-      .in_amo_i     (amo),
-      .in_wen_i     (~s_tcdm_bus_amo_shim_wen[i]), // 0 = write, 1 = read
-      .in_wdata_i   (data),
-      .in_be_i      (s_tcdm_bus_amo_shim_be[i]),
-      .in_rdata_o   (iconn_oup_rdata[i].data),
+      .req_i    ( { s_dma_bus_req,      s_core_tcdm_bus_req}      ),
+      .add_i    ( { s_dma_bus_add,      s_core_tcdm_bus_add}      ),
+      .wen_i    ( { s_dma_bus_wen,      s_core_tcdm_bus_wen}      ),
+      .wdata_i  ( iconn_inp_wdata                                 ),
+      .be_i     ( { s_dma_bus_be,       s_core_tcdm_bus_be}       ),
+      .gnt_o    ( { s_dma_bus_gnt,      s_core_tcdm_bus_gnt}      ),
+      .vld_o    ( { s_dma_bus_r_valid,  s_core_tcdm_bus_r_valid}  ),
+      .rdata_o  ( iconn_inp_rdata                                 ),
 
-      .out_req_o    (tcdm_sram_master[i].req),
-      .out_add_o    (addr),
-      .out_wen_o    (write_enable),
-      .out_wdata_o  (tcdm_sram_master[i].wdata),
-      .out_be_o     (tcdm_sram_master[i].be),
-      .out_rdata_i  (tcdm_sram_master[i].rdata)
+      .req_o    ( s_tcdm_bus_amo_shim_req   ),
+      .gnt_i    ( s_tcdm_bus_amo_shim_gnt   ),
+      .add_o    ( s_tcdm_bus_amo_shim_add   ),
+      .wen_o    ( s_tcdm_bus_amo_shim_wen   ),
+      .wdata_o  ( iconn_oup_wdata           ),
+      .be_o     ( s_tcdm_bus_amo_shim_be    ),
+      .rdata_i  ( iconn_oup_rdata           )
     );
-    assign iconn_oup_rdata[i].atop = '0;
-    always_comb begin
-      tcdm_sram_master[i].add = '0;
-      tcdm_sram_master[i].add[ADDR_MEM_WIDTH-1:0] = addr[ADDR_MEM_WIDTH+2-1:2];
+
+    for (genvar i = 0; i < NUM_TCDM_ICONN_IN; i++) begin : gen_iconn_pack_inp_data
+      if (i < NB_CORES + NB_HWACC_PORTS) begin
+        assign iconn_inp_wdata[i].data = s_core_tcdm_bus_wdata[i];
+        assign s_core_tcdm_bus_r_rdata[i] = iconn_inp_rdata[i].data;
+      end else begin
+        assign iconn_inp_wdata[i].data = s_dma_bus_wdata[i - (NB_CORES + NB_HWACC_PORTS)];
+        assign s_dma_bus_r_rdata[i - (NB_CORES + NB_HWACC_PORTS)] = iconn_inp_rdata[i].data;
+      end
+      if (i < NB_CORES) begin
+        assign iconn_inp_wdata[i].atop = core_tcdm_slave_atop[i];
+      end else if (i < NB_CORES + NB_EXT) begin
+        assign iconn_inp_wdata[i].atop = ext_slave_atop[i-NB_CORES];
+      end else begin
+        assign iconn_inp_wdata[i].atop = '0;
+      end
     end
-    assign tcdm_sram_master[i].wen = ~write_enable;
+
+    for (genvar i = 0; i < NB_TCDM_BANKS; i++) begin : gen_amo_shim
+      // Map ATOPs by RI5CYs to AMOs.
+      logic [DATA_WIDTH-1:0] data;
+      logic [5:0] atop;
+      logic [3:0] amo;
+      assign atop = iconn_oup_wdata[i].atop;
+      always_comb begin
+        amo = '0;
+        data = iconn_oup_wdata[i].data;
+        if (atop[5]) begin
+          unique casez (atop[4:0])
+            riscv_defines::AMO_ADD:   amo = 4'h2;
+            riscv_defines::AMO_SWAP:  amo = 4'h1;
+            riscv_defines::AMO_LR:    `ifndef TARGET_SYNTHESIS $error("Unsupported LR on L1!") `endif;
+            riscv_defines::AMO_SC:    `ifndef TARGET_SYNTHESIS $error("Unsupported SC on L1!") `endif;
+            default: begin
+              `ifndef TARGET_SYNTHESIS
+                assert (atop[1:0] == '0) else $error("Illegal AMO!");
+              `endif
+              unique case (atop[4:2])
+                riscv_defines::AMO_XOR[4:2]:  amo = 4'h5;
+                riscv_defines::AMO_OR[4:2]:   amo = 4'h4;
+                riscv_defines::AMO_AND[4:2]:  amo = 4'h3;
+                riscv_defines::AMO_MIN[4:2]:  amo = 4'h8;
+                riscv_defines::AMO_MAX[4:2]:  amo = 4'h6;
+                riscv_defines::AMO_MINU[4:2]: amo = 4'h9;
+                riscv_defines::AMO_MAXU[4:2]: amo = 4'h7;
+              endcase
+            end
+          endcase
+        end else begin
+          amo = 4'h0; // AMONone
+        end
+      end
+      logic write_enable;
+      logic [ADDR_MEM_WIDTH+2-1:0] addr;
+      amo_shim #(
+        .AddrMemWidth (ADDR_MEM_WIDTH+2),
+        .DataWidth    (DATA_WIDTH)
+      ) i_amo_shim (
+        .clk_i,
+        .rst_ni,
+
+        .in_req_i     (s_tcdm_bus_amo_shim_req[i]),
+        .in_gnt_o     (s_tcdm_bus_amo_shim_gnt[i]),
+        .in_add_i     ({s_tcdm_bus_amo_shim_add[i], 2'b00}),
+        .in_amo_i     (amo),
+        .in_wen_i     (~s_tcdm_bus_amo_shim_wen[i]), // 0 = write, 1 = read
+        .in_wdata_i   (data),
+        .in_be_i      (s_tcdm_bus_amo_shim_be[i]),
+        .in_rdata_o   (iconn_oup_rdata[i].data),
+
+        .out_req_o    (tcdm_sram_master[i].req),
+        .out_add_o    (addr),
+        .out_wen_o    (write_enable),
+        .out_wdata_o  (tcdm_sram_master[i].wdata),
+        .out_be_o     (tcdm_sram_master[i].be),
+        .out_rdata_i  (tcdm_sram_master[i].rdata)
+      );
+      assign iconn_oup_rdata[i].atop = '0;
+      always_comb begin
+        tcdm_sram_master[i].add = '0;
+        tcdm_sram_master[i].add[ADDR_MEM_WIDTH-1:0] = addr[ADDR_MEM_WIDTH+2-1:2];
+      end
+      assign tcdm_sram_master[i].wen = ~write_enable;
+    end
+
+  end
+
+  /* TCDM interconnect -> SRAM */
+  else begin : tcdm_interco_no_amo
+    tcdm_interconnect #(
+      .NumIn        ( NUM_TCDM_ICONN_IN           ),
+      .NumOut       ( NB_TCDM_BANKS               ),
+      .AddrWidth    ( ADDR_WIDTH                  ),
+      .DataWidth    ( $bits(tcdm_data_t)          ),
+      .ByteOffWidth ( $clog2(DATA_WIDTH-1)-3      ), // determine byte offset from real data width
+      .AddrMemWidth ( ADDR_MEM_WIDTH              ),
+      .WriteRespOn  ( 1                           ),
+      .RespLat      ( 1                           ),
+      .Topology     ( tcdm_interconnect_pkg::LIC  )
+    ) i_tcdm_interconnect (
+      .clk_i,
+      .rst_ni,
+
+      .req_i    ( { s_dma_bus_req,      s_core_tcdm_bus_req}      ),
+      .add_i    ( { s_dma_bus_add,      s_core_tcdm_bus_add}      ),
+      .wen_i    ( { s_dma_bus_wen,      s_core_tcdm_bus_wen}      ),
+      .wdata_i  ( iconn_inp_wdata                                 ),
+      .be_i     ( { s_dma_bus_be,       s_core_tcdm_bus_be}       ),
+      .gnt_o    ( { s_dma_bus_gnt,      s_core_tcdm_bus_gnt}      ),
+      .vld_o    ( { s_dma_bus_r_valid,  s_core_tcdm_bus_r_valid}  ),
+      .rdata_o  ( iconn_inp_rdata                                 ),
+
+      .req_o    ( s_tcdm_bus_req                                  ),
+      .gnt_i    ( s_tcdm_bus_gnt                                  ),
+      .add_o    ( s_tcdm_bus_add                                  ),
+      .wen_o    ( s_tcdm_bus_wen                                  ),
+      .wdata_o  ( iconn_oup_wdata                                 ),
+      .be_o     ( s_tcdm_bus_be                                   ),
+      .rdata_i  ( iconn_oup_rdata                                 )
+    );
+
+    for (genvar i = 0; i < NUM_TCDM_ICONN_IN; i++) begin : gen_iconn_pack_inp_data
+      if (i < NB_CORES + NB_HWACC_PORTS) begin
+        assign iconn_inp_wdata[i].data = s_core_tcdm_bus_wdata[i];
+        assign s_core_tcdm_bus_r_rdata[i] = iconn_inp_rdata[i].data;
+      end else begin
+        assign iconn_inp_wdata[i].data = s_dma_bus_wdata[i - (NB_CORES + NB_HWACC_PORTS)];
+        assign s_dma_bus_r_rdata[i - (NB_CORES + NB_HWACC_PORTS)] = iconn_inp_rdata[i].data;
+      end
+      if (i < NB_CORES) begin
+        assign iconn_inp_wdata[i].atop = core_tcdm_slave_atop[i];
+      end else if (i < NB_CORES + NB_EXT) begin
+        assign iconn_inp_wdata[i].atop = ext_slave_atop[i-NB_CORES];
+      end else begin
+        assign iconn_inp_wdata[i].atop = '0;
+      end
+    end
+
+    for (genvar i = 0; i < NB_TCDM_BANKS; i++) begin : gen_tcdm_assign
+      assign tcdm_sram_master[i].req    = s_tcdm_bus_req[i];
+      assign tcdm_sram_master[i].wen    = s_tcdm_bus_wen[i];
+      assign tcdm_sram_master[i].be     = s_tcdm_bus_be[i];
+      assign tcdm_sram_master[i].add    = s_tcdm_bus_add[i];
+      assign s_tcdm_bus_gnt[i]          = s_tcdm_bus_req[i];
+      assign tcdm_sram_master[i].wdata  = iconn_oup_wdata[i].data;
+      assign iconn_oup_rdata[i].data    = tcdm_sram_master[i].rdata;
+    end
   end
 
   localparam int unsigned PE_XBAR_N_INPS = NB_CORES + NB_MPERIPHS;

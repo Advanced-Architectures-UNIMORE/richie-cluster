@@ -228,7 +228,7 @@ module cluster_dma_frontend #(
       idma_req.src_addr = transf_descr_arb.src_addr;
       idma_req.dst_addr = transf_descr_arb.dst_addr;
 
-      idma_req.opt.axi_id             = '0; // AXI ID must be non null if want to take advantage of interleaving
+      idma_req.opt.axi_id             = cluster_id_i;
       // DMA only supports incremental burst
       idma_req.opt.src.burst          = axi_pkg::BURST_INCR;
       idma_req.opt.src.cache          = '0;

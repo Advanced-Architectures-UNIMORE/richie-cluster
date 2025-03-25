@@ -83,6 +83,11 @@ module cluster_peripherals import pulp_cluster_package::*;
 
   // Control ports
   MP_PF_ICACHE_CTRL_UNIT_BUS.Master      IC_ctrl_unit_bus
+  // SP_ICACHE_CTRL_UNIT_BUS.Master      IC_ctrl_unit_bus_main[NB_CACHE_BANKS-1:0],
+  // PRI_ICACHE_CTRL_UNIT_BUS.Master     IC_ctrl_unit_bus_pri[NB_CORES-1:0],
+  // output logic [NB_CORES-1:0]         enable_l1_l15_prefetch_o,
+  // output logic [NB_CORES-1:0]         flush_valid_o,
+  // input  logic [NB_CORES-1:0]         flush_ready_i
 );
 
   logic                      s_timer_out_lo_event;
@@ -231,11 +236,12 @@ module cluster_peripherals import pulp_cluster_package::*;
       end
     end
   endgenerate
-     
+
   mp_pf_icache_ctrl_unit #(
     .NB_CACHE_BANKS ( NB_CACHE_BANKS       ),
     .NB_CORES       ( NB_CORES             ),
-    .ID_WIDTH       ( NB_CORES+NB_MPERIPHS )
+    .ID_WIDTH       ( NB_CORES+NB_MPERIPHS ),
+    .FEATURE_STAT   ( 1'b1                 )
   ) icache_ctrl_unit_i (
     .clk_i                  ( clk_i                           ),
     .rst_ni                 ( rst_ni                          ),
@@ -243,6 +249,21 @@ module cluster_peripherals import pulp_cluster_package::*;
     .IC_ctrl_unit_master_if ( IC_ctrl_unit_bus                ),
     .pf_event_o             ( pf_event_o                      )
   );
+
+  // assign flush_valid_o = '0;
+  // assign pf_event_o = '0; // check if needed by the cluster!
+  // hier_icache_ctrl_unit_wrap #(
+  //   .NB_CACHE_BANKS ( NB_CACHE_BANKS       ),
+  //   .NB_CORES       ( NB_CORES             ),
+  //   .ID_WIDTH       ( NB_CORES+NB_MPERIPHS )
+  // ) icache_ctrl_unit_i (
+  //   .clk_i                       (  clk_i                           ),
+  //   .rst_ni                      (  rst_ni                          ),
+  //   .speriph_slave               (  speriph_slave[SPER_ICACHE_CTRL] ),
+  //   .IC_ctrl_unit_bus_pri        (  IC_ctrl_unit_bus_pri            ),
+  //   .IC_ctrl_unit_bus_main       (  IC_ctrl_unit_bus_main           ),
+  //   .enable_l1_l15_prefetch_o    (  enable_l1_l15_prefetch_o        )
+  // );
 
   // dma binding
   assign speriph_slave[SPER_DMA_ID].gnt     = dma_cfg_master.gnt;
